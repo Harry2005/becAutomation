@@ -1004,10 +1004,15 @@ local function reportBaselineStock()
   end
 end
 
-local function stageRefillFluid(entry, requiredAmount)
+local function stageRefillFluid(entry, requiredAmount, options)
+  options = options or {}
   local refill = config.refill
   local route = refillRoutes[entry.source]
-  uiPhase("STAGING", "Loading " .. entry.source)
+  local interruptForOrder = options.interruptForOrder ~= false
+  uiPhase(
+    options.phase or "STAGING",
+    (options.detailPrefix or "Loading ") .. entry.source
+  )
   local target = math.ceil(requiredAmount / entry.unit) * entry.unit
   local current = readRefillFluids()[entry.source] or 0
   if current >= target then return "ready", current end
@@ -1026,7 +1031,7 @@ local function stageRefillFluid(entry, requiredAmount)
     + estimatedPulses * (REFILL_PULSE_DURATION + REFILL_PULSE_INTERVAL)
   local pulseCount = 0
   while current < target do
-    if hasAnyOrderInput(readNetwork()) then return "order", current end
+    if interruptForOrder and hasAnyOrderInput(readNetwork()) then return "order", current end
     if now() - started > allowedDuration then
       fail(string.format(
         "timed out staging %s: current=%s target=%s rate=%s mB/s pulses=%d",
@@ -1045,7 +1050,7 @@ local function stageRefillFluid(entry, requiredAmount)
     local pulseStarted = now()
     local ok, state, observed = xpcall(function()
       while now() - pulseStarted < REFILL_PULSE_DURATION do
-        if hasAnyOrderInput(readNetwork()) then return "order", current end
+        if interruptForOrder and hasAnyOrderInput(readNetwork()) then return "order", current end
         current = readRefillFluids()[entry.source] or 0
         os.sleep(refill.poll)
       end
@@ -1064,7 +1069,7 @@ local function stageRefillFluid(entry, requiredAmount)
 
     local intervalStarted = now()
     while now() - intervalStarted < REFILL_PULSE_INTERVAL do
-      if hasAnyOrderInput(readNetwork()) then return "order", observed end
+      if interruptForOrder and hasAnyOrderInput(readNetwork()) then return "order", observed end
       os.sleep(refill.poll)
     end
     current = readRefillFluids()[entry.source] or observed or 0
@@ -1094,14 +1099,19 @@ local function stopRefillDrainBestEffort()
   return #errors == 0, table.concat(errors, "; ")
 end
 
-local function drainRefillBatch()
+local function drainRefillBatch(requiredCondensate, options)
+  options = options or {}
   local refill = config.refill
+  local targets = requiredCondensate or targetByCondensate
+  local interruptForOrder = options.interruptForOrder ~= false
   local initialStored = getStoredCondensate()
-  local initialDeficits = getDeficits(targetByCondensate, initialStored)
+  local initialDeficits = getDeficits(targets, initialStored)
   if not next(initialDeficits) then return "ready", initialStored end
 
-  uiPhase("REFILL", "Converting staged fluids")
-  log("INFO", "connecting staged refill fluids to entangler: " .. deficitText(initialDeficits))
+  uiPhase(options.phase or "REFILL", options.detail or "Converting staged fluids")
+  local logPrefix = options.logPrefix or "automatic refill"
+  log("INFO", logPrefix .. " connecting staged fluids to entangler: "
+    .. deficitText(initialDeficits))
   local stagedFluids = readRefillFluids()
   local refillStrength = math.max(
     baselineFieldStrength,
@@ -1120,9 +1130,11 @@ local function drainRefillBatch()
   local previousEntanglerActive
   local ok, state, finalStored = xpcall(function()
     while true do
-      if hasAnyOrderInput(readNetwork()) then return "order", getStoredCondensate() end
+      if interruptForOrder and hasAnyOrderInput(readNetwork()) then
+        return "order", getStoredCondensate()
+      end
       local stored = getStoredCondensate()
-      local deficits = getDeficits(targetByCondensate, stored)
+      local deficits = getDeficits(targets, stored)
       if not next(deficits) then return "ready", stored end
 
       local total = sumValues(stored)
@@ -1159,7 +1171,7 @@ local function drainRefillBatch()
         fail("entangler inactive without condensate progress: " .. deficitText(deficits))
       end
       if now() - lastStatus >= config.timings.statusInterval then
-        log("INFO", "idle refill converting: " .. deficitText(deficits)
+        log("INFO", logPrefix .. " converting: " .. deficitText(deficits)
           .. "; staged-total=" .. formatInteger(sumValues(staged))
           .. "; entangler=" .. (entanglerActive and "running" or "idle")
           .. "; signal=" .. tostring(activitySignal))
@@ -1429,6 +1441,60 @@ local function stateText(states)
   return table.concat(parts, ",")
 end
 
+local function tryHaltAutomaticRefill(activeFieldStrength, shortages)
+  if not ((config.refill or {}).enabled) or not next(shortages) then
+    return activeFieldStrength, false
+  end
+
+  local entryByCondensate = {}
+  for _, entry in ipairs(config.fluids) do
+    entryByCondensate[entry.condensate] = entry
+  end
+  for condensate in pairs(shortages) do
+    if not entryByCondensate[condensate] then
+      fail("HALT automatic refill has no source route for " .. tostring(condensate))
+    end
+  end
+
+  local stored = getStoredCondensate()
+  local requiredStock = {}
+  log("WARN", "HALT attempting automatic-refill recovery: " .. deficitText(shortages))
+  for condensate, missing in pairs(shortages) do
+    local entry = entryByCondensate[condensate]
+    requiredStock[condensate] = (stored[condensate] or 0) + missing
+    local stageState = stageRefillFluid(entry, missing, {
+      interruptForOrder = false,
+      phase = "HALT",
+      detailPrefix = "HALT refill loading ",
+    })
+    if stageState ~= "ready" then
+      fail("HALT automatic refill staging ended in unexpected state " .. tostring(stageState))
+    end
+  end
+
+  local drainState, finalStored = drainRefillBatch(requiredStock, {
+    interruptForOrder = false,
+    phase = "HALT",
+    detail = "HALT converting automatic-refill fluids",
+    logPrefix = "HALT automatic refill",
+  })
+  finalStored = finalStored or getStoredCondensate()
+  activeFieldStrength = math.max(
+    activeFieldStrength,
+    refillFieldStrengthFloor,
+    sumValues(finalStored)
+  )
+  local remaining = getDeficits(requiredStock, finalStored)
+  if drainState ~= "ready" or next(remaining) then
+    log("WARN", "HALT automatic-refill attempt ended without enough condensate: "
+      .. deficitText(remaining))
+    return activeFieldStrength, false
+  end
+
+  log("INFO", "HALT automatic-refill recovery reached the active recipe requirement")
+  return activeFieldStrength, true
+end
+
 local function applyCondensateFaultStop(phase, detail, states, parallel)
   uiUpdate({
     phase = phase,
@@ -1478,7 +1544,14 @@ local function applyCondensateFaultStop(phase, detail, states, parallel)
   return stopErrors
 end
 
-local function haltForCondensateShortage(shortages, states, parallel, reason, stopErrors)
+local function haltForCondensateShortage(
+    activeFieldStrength,
+    shortages,
+    states,
+    parallel,
+    reason,
+    stopErrors
+)
   haltLatched = true
   local detail = reason or ("Condensate shortage: " .. deficitText(shortages))
   if stopErrors == nil then
@@ -1499,9 +1572,103 @@ local function haltForCondensateShortage(shortages, states, parallel, reason, st
   for _, message in ipairs(stopErrors) do log("ERROR", "HALT shutdown failure: " .. message) end
   uiUpdate({ phase = "HALT", detail = detail, haltActive = true }, true)
 
+  if (config.refill or {}).enabled then
+    local refillStored = getStoredCondensate()
+    local refillIdle, _, refillParallel, refillRemaining = allNodesIdle()
+    local refillShortages = getDeficits(refillRemaining, refillStored)
+    if refillParallel > 0 and not refillIdle and next(refillShortages) then
+      local refillOk, updatedFieldStrength, refillSatisfied = xpcall(function()
+        return tryHaltAutomaticRefill(activeFieldStrength, refillShortages)
+      end, debug.traceback)
+      if refillOk then
+        activeFieldStrength = updatedFieldStrength
+        detail = refillSatisfied
+          and "HALT automatic refill complete; verifying active recipe inventory"
+          or "HALT automatic refill incomplete; monitoring condensate inventory"
+      else
+        detail = "HALT automatic refill failed; monitoring condensate inventory"
+        log("ERROR", "HALT automatic-refill recovery failed: " .. tostring(updatedFieldStrength))
+        dashboardPaused = false
+        pcall(setAllRefillSourcesOff)
+        pcall(setRefillLink, false)
+      end
+      uiUpdate({ phase = "HALT", detail = detail, haltActive = true }, true)
+    end
+  end
+
+  local lastStatus = -math.huge
+  local nextResumeAttempt = 0
   while true do
-    uiUpdate({ phase = "HALT", detail = detail, haltActive = true }, true)
-    os.sleep(1)
+    local stored = getStoredCondensate()
+    local storedTotal = sumValues(stored)
+    local idle, currentStates, currentParallel, remainingCondensate = allNodesIdle()
+    local currentShortages = getDeficits(remainingCondensate, stored)
+    local activeRecipePresent = currentParallel > 0 and not idle
+
+    if activeRecipePresent
+        and not next(currentShortages)
+        and now() >= nextResumeAttempt then
+      if storedTotal > activeFieldStrength then
+        activeFieldStrength = storedTotal
+        checked(
+          "preserve HALT recovery condensate field strength",
+          storage.setFieldStrength,
+          activeFieldStrength
+        )
+        uiUpdate({ fieldStrength = activeFieldStrength })
+      end
+      refillFieldStrengthFloor = math.max(refillFieldStrengthFloor, activeFieldStrength)
+
+      local resumeOk, resumeReason = xpcall(function()
+        -- Enable the local machines while the external interlock is still
+        -- asserted, then release HALT as the final resume action.
+        setMachinesAllowed(true)
+        setHaltOutput(false)
+      end, debug.traceback)
+      if resumeOk then
+        haltLatched = false
+        uiPhase("RUNNING", "HALT inventory requirement satisfied; nodes resumed")
+        log("INFO", "HALT condensate monitor found sufficient inventory; interlock released and nodes resumed")
+        return activeFieldStrength
+      end
+
+      detail = "HALT inventory is sufficient but resume failed: " .. tostring(resumeReason)
+      log("ERROR", detail)
+      nextResumeAttempt = now() + math.max(1, config.timings.statusInterval)
+      local retryStopErrors = applyCondensateFaultStop(
+        "HALT",
+        detail,
+        currentStates,
+        currentParallel
+      )
+      for _, message in ipairs(retryStopErrors) do
+        log("ERROR", "HALT retry shutdown failure: " .. message)
+      end
+    elseif activeRecipePresent and next(currentShortages) then
+      detail = "HALT waiting for condensate: " .. deficitText(currentShortages)
+    elseif activeRecipePresent then
+      detail = "HALT inventory is sufficient; waiting to retry machine resume"
+    else
+      detail = "HALT cannot auto-resume: active node recipe state is unavailable"
+    end
+
+    uiUpdate({
+      phase = "HALT",
+      detail = detail,
+      haltActive = true,
+      nodeStates = currentStates,
+      nodeParallel = currentParallel,
+      fieldStrength = activeFieldStrength,
+    }, true)
+    if now() - lastStatus >= config.timings.statusInterval then
+      log("WARN", "HALT monitoring: "
+        .. (next(currentShortages) and deficitText(currentShortages) or "condensate requirement satisfied")
+        .. "; stored=" .. formatInteger(storedTotal)
+        .. "; nodes={" .. stateText(currentStates) .. "}"
+        .. "; parallel=" .. tostring(currentParallel))
+      lastStatus = now()
+    end
+    os.sleep(config.timings.poll)
   end
 end
 
@@ -1517,19 +1684,22 @@ local function recoverCondensateShortage(
   local stopErrors = applyCondensateFaultStop("RECOVERING", detail, states, parallel)
   log("WARN", "condensate shortage detected; automatic recovery started: " .. deficitText(shortages))
   if #stopErrors > 0 then
-    haltForCondensateShortage(
+    activeFieldStrength = haltForCondensateShortage(
+      activeFieldStrength,
       shortages,
       states,
       parallel,
       "Recovery could not stop all processing paths",
       stopErrors
     )
+    return activeFieldStrength, alreadyPulsedFluidSignature
   end
 
   local snapshot = readNetwork()
   if snapshot.itemTotal ~= 0
       or (snapshot.fluidTotal <= 0 and not recoveryFluidInFlight) then
-    haltForCondensateShortage(
+    activeFieldStrength = haltForCondensateShortage(
+      activeFieldStrength,
       shortages,
       states,
       parallel,
@@ -1540,6 +1710,7 @@ local function recoverCondensateShortage(
       ),
       stopErrors
     )
+    return activeFieldStrength, alreadyPulsedFluidSignature
   end
 
   local stored = getStoredCondensate()
@@ -1568,13 +1739,15 @@ local function recoverCondensateShortage(
       transferOrderFluidsToBuffer("HALT automatic recovery", snapshot.fluidTotal)
     end, debug.traceback)
     if not pulseOk then
-      haltForCondensateShortage(
+      activeFieldStrength = haltForCondensateShortage(
+        activeFieldStrength,
         shortages,
         states,
         parallel,
         "Recovery fluid transfer failed: " .. tostring(pulseReason),
         stopErrors
       )
+      return activeFieldStrength, recoveryFluidSignature
     end
     recoveryFluidSignature = snapshot.fluidSignature
   else
@@ -1627,13 +1800,15 @@ local function recoverCondensateShortage(
 
     if not entanglerActive
         and now() - lastActivity > config.timings.condensateWaitTimeout then
-      haltForCondensateShortage(
+      activeFieldStrength = haltForCondensateShortage(
+        activeFieldStrength,
         shortages,
         states,
         parallel,
         "Recovery entangler made no progress before timeout",
         stopErrors
       )
+      return activeFieldStrength, recoveryFluidSignature
     end
     if now() - lastStatus >= config.timings.statusInterval then
       log("INFO", "HALT recovery waiting: buffered-fluid=" .. formatInteger(bufferedFluidTotal)
@@ -1649,17 +1824,20 @@ local function recoverCondensateShortage(
   stored = getStoredCondensate()
   local recoveredIdle, recoveredStates, recoveredParallel, recoveredRemaining = allNodesIdle()
   if recoveredParallel <= 0 or recoveredIdle then
-    haltForCondensateShortage(
+    activeFieldStrength = haltForCondensateShortage(
+      activeFieldStrength,
       shortages,
       recoveredStates,
       recoveredParallel,
       "Recovery failed: active node recipe state disappeared",
       stopErrors
     )
+    return activeFieldStrength, recoveryFluidSignature
   end
   local remainingShortages = getDeficits(recoveredRemaining, stored)
   if next(remainingShortages) then
-    haltForCondensateShortage(
+    activeFieldStrength = haltForCondensateShortage(
+      activeFieldStrength,
       remainingShortages,
       recoveredStates,
       recoveredParallel,
@@ -1667,6 +1845,7 @@ local function recoverCondensateShortage(
         .. deficitText(remainingShortages),
       stopErrors
     )
+    return activeFieldStrength, recoveryFluidSignature
   end
 
   local recoveredStoredTotal = sumValues(stored)
@@ -1678,16 +1857,18 @@ local function recoverCondensateShortage(
   refillFieldStrengthFloor = math.max(refillFieldStrengthFloor, activeFieldStrength)
 
   local resumeOk, resumeReason = xpcall(function()
-    setHaltOutput(false)
     setMachinesAllowed(true)
+    setHaltOutput(false)
   end, debug.traceback)
   if not resumeOk then
-    haltForCondensateShortage(
+    activeFieldStrength = haltForCondensateShortage(
+      activeFieldStrength,
       shortages,
       recoveredStates,
       recoveredParallel,
       "Recovery inventory is sufficient but processing could not resume: " .. tostring(resumeReason)
     )
+    return activeFieldStrength, recoveryFluidSignature
   end
 
   uiPhase("RUNNING", "Automatic condensate recovery succeeded; nodes resumed")
