@@ -1,9 +1,18 @@
 local computer = require("computer")
+local event = require("event")
+local keyboard = require("keyboard")
 local term = require("term")
 
 local M = {}
 local Dashboard = {}
 Dashboard.__index = Dashboard
+local MiB = 1024 * 1024
+local MAX_CACHE_MIB = 1000000
+local MAX_RATE_LITERS = 2147483
+
+local function litersPerSecond(rate)
+  return (string.format("%.3f", rate):gsub("0+$", ""):gsub("%.$", ""))
+end
 
 local COLORS = {
   background = 0x111417,
@@ -144,6 +153,7 @@ function Dashboard:log(level, message, timestamp)
 end
 
 function Dashboard:render(force)
+  if self.editorOpen then return end
   local now = computer.uptime()
   if not force and now - self.lastRender < self.refreshInterval then return end
   self.lastRender = now
@@ -232,12 +242,17 @@ function Dashboard:render(force)
   if order and fluidRatio >= 1 then fluidColor = COLORS.green end
   self:_line(8, fluidProgress, fluidColor, COLORS.background)
   self:_line(9, string.rep("-", self.width), COLORS.muted, COLORS.background)
-  self:_line(10, " CONDENSATE CACHE  current / target", COLORS.muted, COLORS.panel)
+  self:_line(10,
+    " CONDENSATE CACHE  current / target  "
+      .. (self.configRequested and "[CONFIG QUEUED]" or "[CONFIG]"),
+    self.configRequested and COLORS.yellow or COLORS.muted, COLORS.panel)
 
   local columns = 2
   local rows = 10
   local cellWidth = math.floor(self.width / columns)
   local stored = state.condensates or {}
+  self:_colors(COLORS.text, COLORS.background)
+  self.gpu.fill(1, 11, self.width, rows, " ")
   for index, entry in ipairs(self.fluids) do
     local column = math.floor((index - 1) / rows)
     local row = (index - 1) % rows
@@ -276,7 +291,148 @@ function Dashboard:render(force)
   end
 end
 
+function Dashboard:takeConfigRequest()
+  if not self.configRequested then return false end
+  self.configRequested = false
+  return true
+end
+
+function Dashboard:hasConfigRequest()
+  return self.configRequested == true
+end
+
+function Dashboard:editFluidSettings()
+  local values = {}
+  for index, entry in ipairs(self.fluids) do
+    values[index] = {
+      source = entry.source,
+      condensate = entry.condensate,
+      unit = entry.unit,
+      target = entry.target,
+      rateLitersPerSecond = entry.rateLitersPerSecond,
+    }
+  end
+  local selected, field, editing, input, status = 1, 1, false, "", nil
+  local targetX = self.width - 29
+  local pulseX = self.width - 14
+  self.editorOpen = true
+  local ok, result = xpcall(function()
+    while true do
+      self:_colors(COLORS.text, COLORS.background)
+      self.gpu.fill(1, 1, self.width, self.height, " ")
+      self:_line(1, " BEC  /  FLUID CONFIG", COLORS.text, COLORS.header)
+      self:_line(2, " Cache targets and calibrated flow rate", COLORS.muted, COLORS.background)
+      self:_cell(1, 3, targetX - 1, " FLUID", COLORS.muted, COLORS.panel)
+      self:_cell(targetX, 3, pulseX - targetX, " CACHE MiB", COLORS.muted, COLORS.panel)
+      self:_cell(pulseX, 3, self.width - pulseX + 1, " L/s", COLORS.muted, COLORS.panel)
+      for index, entry in ipairs(values) do
+        local row = index + 3
+        local selectedRow = index == selected
+        local background = selectedRow and COLORS.header or COLORS.background
+        self:_cell(1, row, targetX - 1,
+          string.format(" %2d  %s", index, fluidLabel(entry.source)),
+          selectedRow and COLORS.text or COLORS.muted, background)
+        self:_cell(targetX, row, pulseX - targetX,
+          string.format(" %.0f", math.floor(entry.target / MiB + 0.5)),
+          selectedRow and field == 1 and COLORS.yellow or COLORS.text, background)
+        self:_cell(pulseX, row, self.width - pulseX + 1,
+          " " .. litersPerSecond(entry.rateLitersPerSecond),
+          selectedRow and field == 2 and COLORS.yellow or COLORS.text, background)
+      end
+      if editing then
+        local name = field == 1 and "CACHE MiB" or "L/s"
+        self:_line(self.height - 2, " " .. (status or (name .. ": " .. input
+          .. "_  Enter apply / Esc cancel")),
+          COLORS.yellow, COLORS.panel)
+      else
+        self:_line(self.height - 2, " " .. (status or "Select a value to edit"),
+          status and COLORS.yellow or COLORS.muted, COLORS.panel)
+      end
+      self:_line(self.height - 1,
+        " [ SAVE ] S / click left       [ CANCEL ] Q / click right",
+        COLORS.text, COLORS.header)
+      local name, _, char, code = event.pull()
+      if name == "key_down" then
+        if editing then
+          if code == keyboard.keys.enter then
+            if input ~= "" then
+              local amount = tonumber(input)
+              local maximum = field == 1 and MAX_CACHE_MIB or MAX_RATE_LITERS
+              if not amount or amount > maximum
+                  or (field == 1 and amount % 1 ~= 0)
+                  or (field == 2 and amount < 0.001) then
+                status = "Invalid value (max " .. maximum .. (field == 2 and ", min 0.001" or "") .. ")"
+              elseif field == 1 then
+                values[selected].target = math.floor(amount * MiB / values[selected].unit)
+                  * values[selected].unit
+                editing, status = false, nil
+              else
+                values[selected].rateLitersPerSecond = math.floor(amount * 1000 + 0.5) / 1000
+                editing, status = false, nil
+              end
+            else
+              editing = false
+            end
+          elseif code == keyboard.keys.esc then
+            editing, status = false, nil
+          elseif code == keyboard.keys.back then
+            input = input:sub(1, -2)
+          elseif field == 2 and char == 46 and input ~= ""
+              and not input:find(".", 1, true) and #input < 12 then
+            input = input .. "."
+          elseif char and char >= 48 and char <= 57 and #input < 12
+              and (field ~= 2 or not input:match("%.%d%d%d$")) then
+            input = input .. string.char(char)
+          end
+        elseif code == keyboard.keys.up then
+          selected = math.max(1, selected - 1)
+        elseif code == keyboard.keys.down then
+          selected = math.min(#values, selected + 1)
+        elseif code == keyboard.keys.left then
+          field = 1
+        elseif code == keyboard.keys.right then
+          field = 2
+        elseif code == keyboard.keys.enter then
+          editing, input, status = true, "", nil
+        elseif code == keyboard.keys.s then
+          local total = 0
+          for _, entry in ipairs(values) do total = total + entry.target end
+          if total > 0 then return values end
+          status = "At least one cache target must be positive"
+        elseif code == keyboard.keys.q or code == keyboard.keys.esc then
+          return nil
+        end
+      elseif name == "touch" then
+        local x, y = char, code
+        if y >= 4 and y <= 3 + #values then
+          selected = y - 3
+          if x >= targetX then
+            field = x >= pulseX and 2 or 1
+            editing, input, status = true, "", nil
+          end
+        elseif y >= self.height - 1 and not editing then
+          if x <= self.width / 2 then
+            local total = 0
+            for _, entry in ipairs(values) do total = total + entry.target end
+            if total > 0 then return values end
+            status = "At least one cache target must be positive"
+          else
+            return nil
+          end
+        end
+      end
+    end
+  end, debug.traceback)
+  self.editorOpen = false
+  self.configRequested = false
+  self.lastRender = -math.huge
+  self:render(true)
+  if not ok then error(result, 0) end
+  return result
+end
+
 function Dashboard:close()
+  if self.touchListener then pcall(event.ignore, "touch", self.touchListener) end
   pcall(self.gpu.setForeground, self.oldForeground, false)
   pcall(self.gpu.setBackground, self.oldBackground, false)
   pcall(self.gpu.setResolution, self.oldWidth, self.oldHeight)
@@ -332,6 +488,14 @@ function M.new(options, fluids)
   self:_colors(COLORS.text, COLORS.background)
   term.clear()
   self:render(true)
+  self.screenAddress = gpu.getScreen()
+  self.touchListener = function(_, screen, _, y)
+    if not self.editorOpen and screen == self.screenAddress and y >= 10 and y <= 20 then
+      self.configRequested = true
+      self:render(true)
+    end
+  end
+  event.listen("touch", self.touchListener)
   return self
 end
 

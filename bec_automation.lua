@@ -1,8 +1,7 @@
 local component = require("component")
 local computer = require("computer")
-
-local REFILL_PULSE_DURATION = 1
-local REFILL_PULSE_INTERVAL = 1
+local filesystem = require("filesystem")
+local serialization = require("serialization")
 
 local configOk, config = pcall(require, "bec_automation_config")
 if not configOk then
@@ -250,7 +249,7 @@ local function bindOne(componentType, prefix, label, requiredMethods)
 end
 
 local function validateConfig()
-  if config.schemaVersion ~= 10 then
+  if config.schemaVersion ~= 11 then
     fail(
       "bec_automation_config.lua is outdated or does not match this program; "
         .. "copy the current config file together with bec_automation.lua"
@@ -298,12 +297,6 @@ local function validateConfig()
         fail(entry.name .. " must be a non-empty string")
       end
     end
-    if not isInteger(refill.entanglerToggleSide) or refill.entanglerToggleSide > 5 then
-      fail("refill.entanglerToggleSide must be a side number from 0 to 5")
-    end
-    if not isInteger(refill.activitySide) or refill.activitySide > 5 then
-      fail("refill.activitySide must be a side number from 0 to 5")
-    end
     if not isInteger(refill.activityThreshold) or refill.activityThreshold < 1 then
       fail("refill.activityThreshold must be a positive integer")
     end
@@ -325,16 +318,6 @@ local function validateConfig()
       if type(refill[name]) ~= "number" or refill[name] <= 0 then
         fail("refill." .. name .. " must be a positive number")
       end
-    end
-  end
-  for _, entry in ipairs({
-    { name = "redstone.nodeToggleSide", value = redstoneConfig.nodeToggleSide },
-    { name = "redstone.generatorToggleSide", value = redstoneConfig.generatorToggleSide },
-    { name = "redstone.synthesisSide", value = redstoneConfig.synthesisSide },
-    { name = "redstone.haltSide", value = redstoneConfig.haltSide },
-  }) do
-    if not isInteger(entry.value) or entry.value > 5 then
-      fail(entry.name .. " must be a side number from 0 to 5")
     end
   end
   if redstoneConfig.connectSignal == redstoneConfig.disconnectSignal then
@@ -377,8 +360,10 @@ local function validateConfig()
     if entry.target % entry.unit ~= 0 then
       fail("fluids[" .. index .. "].target must be divisible by its generator recipe unit")
     end
-    if refill.enabled and (type(entry.outputPerSecond) ~= "number" or entry.outputPerSecond <= 0) then
-      fail("fluids[" .. index .. "].outputPerSecond must be a positive number")
+    if refill.enabled and (type(entry.rateLitersPerSecond) ~= "number"
+        or entry.rateLitersPerSecond < 0.001
+        or entry.rateLitersPerSecond > 2147483) then
+      fail("fluids[" .. index .. "].rateLitersPerSecond must be between 0.001 and 2147483 L/s")
     end
     if fluidBySource[entry.source] then fail("duplicate source fluid " .. entry.source) end
     if targetByCondensate[entry.condensate] then fail("duplicate condensate " .. entry.condensate) end
@@ -406,6 +391,20 @@ local function validateConfig()
     end
     if type(routes.unusedOutput) ~= "table" then
       fail("refill route map is missing unusedOutput")
+    end
+    if refill.installedRouteAddresses then
+      local installed = {}
+      for _, address in ipairs(refill.installedRouteAddresses) do installed[address] = true end
+      if not installed[routes.unusedOutput.address] then
+        fail("refill route map uses an old/unknown I/O; rerun bec_route_mapper.lua")
+      end
+      for _, entry in ipairs(config.fluids) do
+        local route = (routes.fluids or {})[entry.source]
+        if type(route) == "table" and not installed[route.address] then
+          fail("refill route map for " .. entry.source
+            .. " uses an old/unknown I/O; rerun bec_route_mapper.lua")
+        end
+      end
     end
     for _, entry in ipairs(config.fluids) do
       if type((routes.fluids or {})[entry.source]) ~= "table" then
@@ -472,14 +471,13 @@ local function bindComponents()
   })
   local fixedOutputs = {}
   for _, output in ipairs({
-    { address = nodeRedstone.address, side = config.redstone.nodeToggleSide, label = "material/item-cache output" },
-    { address = generatorRedstone.address, side = config.redstone.generatorToggleSide, label = "material/fluid-cache output" },
-    { address = synthesisRedstone.address, side = config.redstone.synthesisSide, label = "synthesis-active output" },
-    { address = haltRedstone.address, side = config.redstone.haltSide, label = "HALT output" },
+    { address = nodeRedstone.address, label = "material/item-cache output" },
+    { address = generatorRedstone.address, label = "material/fluid-cache output" },
+    { address = synthesisRedstone.address, label = "synthesis-active output" },
+    { address = haltRedstone.address, label = "HALT output" },
   }) do
-    local key = output.address .. ":" .. output.side
-    if fixedOutputs[key] then fail(output.label .. " overlaps " .. fixedOutputs[key]) end
-    fixedOutputs[key] = output.label
+    if fixedOutputs[output.address] then fail(output.label .. " overlaps " .. fixedOutputs[output.address]) end
+    fixedOutputs[output.address] = output.label
   end
 
   if (config.refill or {}).enabled then
@@ -498,16 +496,23 @@ local function bindComponents()
     })
 
     local usedOutputs = {}
+    local usedDevices = {}
+    local routeDevices = {}
+    local function claimDevice(address, label)
+      if usedDevices[address] then fail(label .. " overlaps " .. usedDevices[address]) end
+      usedDevices[address] = label
+    end
     local function claimOutput(address, side, label)
+      if usedDevices[address] then fail(label .. " overlaps " .. usedDevices[address]) end
       local key = address .. ":" .. side
       if usedOutputs[key] then fail(label .. " overlaps " .. usedOutputs[key]) end
       usedOutputs[key] = label
     end
-    claimOutput(nodeRedstone.address, config.redstone.nodeToggleSide, "material/item-cache output")
-    claimOutput(generatorRedstone.address, config.redstone.generatorToggleSide, "material/fluid-cache output")
-    claimOutput(synthesisRedstone.address, config.redstone.synthesisSide, "synthesis-active output")
-    claimOutput(haltRedstone.address, config.redstone.haltSide, "HALT output")
-    claimOutput(refillLinkRedstone.address, refill.entanglerToggleSide, "automatic-refill/entangler toggle bus")
+    claimDevice(nodeRedstone.address, "material/item-cache output")
+    claimDevice(generatorRedstone.address, "material/fluid-cache output")
+    claimDevice(synthesisRedstone.address, "synthesis-active output")
+    claimDevice(haltRedstone.address, "HALT output")
+    claimDevice(refillLinkRedstone.address, "automatic-refill/entangler toggle bus")
     local function bindRouteOutput(definition, label)
       if type(definition.address) ~= "string"
           or not isInteger(definition.side)
@@ -516,6 +521,7 @@ local function bindComponents()
       end
       local device = bindOne("redstone", definition.address, label, { "getOutput", "setOutput" })
       claimOutput(device.address, definition.side, label)
+      routeDevices[device.address] = true
       return {
         address = device.address,
         device = device,
@@ -530,9 +536,8 @@ local function bindComponents()
         "refill route for " .. entry.source
       )
     end
-    local activityKey = refillActivityRedstone.address .. ":" .. refill.activitySide
-    if usedOutputs[activityKey] then
-      fail("entangler activity input overlaps " .. usedOutputs[activityKey])
+    if usedDevices[refillActivityRedstone.address] or routeDevices[refillActivityRedstone.address] then
+      fail("entangler activity input overlaps an output on " .. refillActivityRedstone.address)
     end
   end
 
@@ -570,10 +575,23 @@ end
 
 local function setSignalOutput(device, side, label, connected, signalConfig)
   local value = connected and signalConfig.connectSignal or signalConfig.disconnectSignal
-  checked("set " .. label .. " redstone output", device.setOutput, side, value)
-  local actual = tonumber(checked("read " .. label .. " redstone output", device.getOutput, side))
-  if actual ~= value then
-    fail(string.format("%s redstone output verification failed on side %d: expected=%d actual=%s", label, side, value, tostring(actual)))
+  if side ~= nil then
+    checked("set " .. label .. " redstone output", device.setOutput, side, value)
+    local actual = tonumber(checked("read " .. label .. " redstone output", device.getOutput, side))
+    if actual ~= value then
+      fail(string.format("%s redstone output verification failed on side %d: expected=%d actual=%s", label, side, value, tostring(actual)))
+    end
+  else
+    local values = {}
+    for face = 0, 5 do values[face] = value end
+    checked("set " .. label .. " all-face redstone output", device.setOutput, values)
+    local actual = checked("read " .. label .. " all-face redstone output", device.getOutput)
+    if type(actual) ~= "table" then fail(label .. " getOutput did not return a side table") end
+    for face = 0, 5 do
+      if tonumber(actual[face]) ~= value then
+        fail(string.format("%s redstone output verification failed on side %d: expected=%d actual=%s", label, face, value, tostring(actual[face])))
+      end
+    end
   end
 end
 
@@ -582,26 +600,26 @@ local function setToggle(device, side, label, connected)
 end
 
 local function setNodeNetwork(connected)
-  setToggle(nodeRedstone, config.redstone.nodeToggleSide, "material/item-cache output", connected)
+  setToggle(nodeRedstone, nil, "material/item-cache output", connected)
   uiUpdate({ nodeConnected = connected })
   log("INFO", "material/item-cache output " .. (connected and "enabled" or "disabled"))
 end
 
 local function setOrderFluidTransfer(connected)
-  setToggle(generatorRedstone, config.redstone.generatorToggleSide, "material/fluid-cache output", connected)
+  setToggle(generatorRedstone, nil, "material/fluid-cache output", connected)
   uiUpdate({ fluidConnected = connected })
   log("INFO", "material/fluid-cache output " .. (connected and "enabled" or "disabled"))
 end
 
 local function setSynthesisActive(active)
-  setToggle(synthesisRedstone, config.redstone.synthesisSide, "synthesis-active", active)
+  setToggle(synthesisRedstone, nil, "synthesis-active", active)
   uiUpdate({ synthesisActive = active })
   log("INFO", "synthesis-active redstone output " .. (active and "enabled" or "disabled"))
 end
 
 local function setHaltOutput(active)
   if active then haltInterlockActive = true end
-  setToggle(haltRedstone, config.redstone.haltSide, "HALT", active)
+  setToggle(haltRedstone, nil, "HALT", active)
   if not active then haltInterlockActive = false end
   uiUpdate({ haltActive = active })
   log("INFO", "HALT redstone output " .. (active and "enabled" or "disabled"))
@@ -615,7 +633,7 @@ local function setRefillLink(connected)
   if not refillLinkRedstone then return end
   setSignalOutput(
     refillLinkRedstone,
-    config.refill.entanglerToggleSide,
+    nil,
     "automatic-refill/entangler",
     connected,
     config.refill
@@ -625,11 +643,10 @@ end
 
 local function readEntanglerActivity()
   if not refillActivityRedstone then return false, 0 end
-  local signal = tonumber(checked(
-    "read entangler activity input",
-    refillActivityRedstone.getInput,
-    config.refill.activitySide
-  )) or 0
+  local inputs = checked("read entangler activity input", refillActivityRedstone.getInput)
+  if type(inputs) ~= "table" then fail("entangler activity input did not return a side table") end
+  local signal = 0
+  for face = 0, 5 do signal = math.max(signal, tonumber(inputs[face]) or 0) end
   local active = signal >= config.refill.activityThreshold
   uiUpdate({ entanglerActive = active, entanglerSignal = signal })
   return active, signal
@@ -1004,6 +1021,96 @@ local function reportBaselineStock()
   end
 end
 
+local function saveFluidSettings(entries)
+  local path = config.ui.fluidSettingsFile
+  local data = { schemaVersion = 3, fluids = {} }
+  for _, entry in ipairs(entries) do
+    data.fluids[entry.source] = {
+      target = entry.target,
+      rateLitersPerSecond = entry.rateLitersPerSecond,
+    }
+  end
+  local temp = path .. ".new"
+  local file, reason = io.open(temp, "w")
+  if not file then fail("cannot write fluid settings: " .. tostring(reason)) end
+  local wrote, writeReason = file:write(serialization.serialize(data))
+  if not wrote then
+    pcall(file.close, file)
+    fail("cannot write fluid settings: " .. tostring(writeReason))
+  end
+  local flushed, flushReason = file:flush()
+  if not flushed then
+    pcall(file.close, file)
+    fail("cannot flush fluid settings: " .. tostring(flushReason))
+  end
+  local closed, closeReason = pcall(file.close, file)
+  if not closed then fail("cannot close fluid settings: " .. tostring(closeReason)) end
+
+  local backup
+  if filesystem.exists(path) then
+    local index = 1
+    repeat
+      backup = path .. ".bak" .. index
+      index = index + 1
+    until not filesystem.exists(backup)
+    local moved, moveReason = filesystem.rename(path, backup)
+    if not moved then fail("cannot back up fluid settings: " .. tostring(moveReason)) end
+  end
+  local installed, installReason = filesystem.rename(temp, path)
+  if not installed then
+    if backup then
+      local restored, restoreReason = filesystem.rename(backup, path)
+      if not restored then
+        fail("cannot install fluid settings: " .. tostring(installReason)
+          .. "; previous settings remain at " .. backup
+          .. " (restore failed: " .. tostring(restoreReason) .. ")")
+      end
+    end
+    fail("cannot install fluid settings: " .. tostring(installReason))
+  end
+end
+
+local function applyFluidSettings(entries)
+  if type(entries) ~= "table" or #entries ~= #config.fluids then
+    fail("fluid settings must contain all configured fluids")
+  end
+  local nextBaseline = 0
+  for index, entry in ipairs(entries) do
+    local original = config.fluids[index]
+    if entry.source ~= original.source or entry.condensate ~= original.condensate
+        or entry.unit ~= original.unit
+        or not isInteger(entry.target) or entry.target > 1000000 * 1024 * 1024
+        or entry.target % entry.unit ~= 0
+        or type(entry.rateLitersPerSecond) ~= "number"
+        or entry.rateLitersPerSecond < 0.001
+        or entry.rateLitersPerSecond > 2147483 then
+      fail("invalid fluid settings for " .. original.source)
+    end
+    nextBaseline = nextBaseline + entry.target
+  end
+  if nextBaseline == 0 then fail("at least one fluid target must be positive") end
+
+  local currentStrength = tonumber(checked("read field strength", storage.getFieldStrength))
+  if not currentStrength then fail("BEC storage returned invalid field strength") end
+  local safeStrength = math.max(currentStrength, refillFieldStrengthFloor,
+    nextBaseline, sumValues(getStoredCondensate()))
+  if safeStrength > currentStrength then
+    checked("raise field strength for fluid settings", storage.setFieldStrength, safeStrength)
+    local actual = tonumber(checked("verify field strength", storage.getFieldStrength))
+    if not actual or actual < safeStrength then fail("BEC field strength did not increase") end
+  end
+  saveFluidSettings(entries)
+  for index, entry in ipairs(entries) do
+    config.fluids[index].target = entry.target
+    config.fluids[index].rateLitersPerSecond = entry.rateLitersPerSecond
+    targetByCondensate[entry.condensate] = entry.target
+  end
+  baselineFieldStrength = nextBaseline
+  refillFieldStrengthFloor = math.max(refillFieldStrengthFloor, safeStrength)
+  uiUpdate({ fieldStrength = safeStrength }, true)
+  log("INFO", "fluid cache targets and refill rates saved")
+end
+
 local function stageRefillFluid(entry, requiredAmount, options)
   options = options or {}
   local refill = config.refill
@@ -1017,72 +1124,65 @@ local function stageRefillFluid(entry, requiredAmount, options)
   local current = readRefillFluids()[entry.source] or 0
   if current >= target then return "ready", current end
 
-  local estimatedPulses = math.ceil((target - current) / entry.outputPerSecond)
+  local estimatedSeconds = (target - current) / (entry.rateLitersPerSecond * 1000)
   log("INFO", string.format(
-    "staging refill fluid %s: current=%s target=%s rate=%s mB/s estimated-pulses=%d",
+    "staging refill fluid %s: current=%s target=%s rate=%.3f L/s estimated-time=%.1fs",
     entry.source,
     formatInteger(current),
     formatInteger(target),
-    formatInteger(entry.outputPerSecond),
-    estimatedPulses
+    entry.rateLitersPerSecond,
+    estimatedSeconds
   ))
-  local started = now()
-  local allowedDuration = refill.routeTimeout
-    + estimatedPulses * (REFILL_PULSE_DURATION + REFILL_PULSE_INTERVAL)
-  local pulseCount = 0
-  while current < target do
-    if interruptForOrder and hasAnyOrderInput(readNetwork()) then return "order", current end
-    if now() - started > allowedDuration then
-      fail(string.format(
-        "timed out staging %s: current=%s target=%s rate=%s mB/s pulses=%d",
-        entry.source,
-        formatInteger(current),
-        formatInteger(target),
-        formatInteger(entry.outputPerSecond),
-        pulseCount
-      ))
-    end
-
-    local beforePulse = current
-    pulseCount = pulseCount + 1
-    dashboardPaused = true
+  local lastIncrease = now()
+  local lastAmount = current
+  local lastStatus = -math.huge
+  dashboardPaused = true
+  local ok, state, observed = xpcall(function()
     setRefillSource(route, entry.source, true)
-    local pulseStarted = now()
-    local ok, state, observed = xpcall(function()
-      while now() - pulseStarted < REFILL_PULSE_DURATION do
-        if interruptForOrder and hasAnyOrderInput(readNetwork()) then return "order", current end
-        current = readRefillFluids()[entry.source] or 0
-        os.sleep(refill.poll)
+    while true do
+      if interruptForOrder and hasAnyOrderInput(readNetwork()) then
+        return "order", readRefillFluids()[entry.source] or 0
       end
-      return "pulse-complete", current
-    end, debug.traceback)
-
-    local offOk, offReason = pcall(setRefillSource, route, entry.source, false)
-    dashboardPaused = false
-    uiUpdate({}, true)
-    if not offOk then
-      fail("cannot switch refill source off: " .. tostring(offReason)
-        .. (ok and "" or "; original error: " .. tostring(state)))
-    end
-    if not ok then fail(state) end
-    if state == "order" then return state, observed end
-
-    local intervalStarted = now()
-    while now() - intervalStarted < REFILL_PULSE_INTERVAL do
-      if interruptForOrder and hasAnyOrderInput(readNetwork()) then return "order", observed end
+      current = readRefillFluids()[entry.source] or 0
+      if current >= target then return "ready", current end
+      local timestamp = now()
+      if current > lastAmount then
+        lastAmount = current
+        lastIncrease = timestamp
+      end
+      if timestamp - lastIncrease >= refill.routeTimeout then
+        log("WARN", string.format(
+          "refill source %s produced no cache increase within %.1fs; current=%s target=%s",
+          entry.source,
+          refill.routeTimeout,
+          formatInteger(current),
+          formatInteger(target)
+        ))
+        return "stalled", current
+      end
+      if timestamp - lastStatus >= config.timings.statusInterval then
+        log("INFO", string.format(
+          "refill source %s ON: current=%s target=%s rate=%.3f L/s",
+          entry.source,
+          formatInteger(current),
+          formatInteger(target),
+          entry.rateLitersPerSecond
+        ))
+        lastStatus = timestamp
+      end
       os.sleep(refill.poll)
     end
-    current = readRefillFluids()[entry.source] or observed or 0
-    local delta = math.max(0, current - beforePulse)
-    log("INFO", string.format(
-      "refill pulse %s #%d: duration=1s current=%s delta=%s expected=%s",
-      entry.source,
-      pulseCount,
-      formatInteger(current),
-      formatInteger(delta),
-      formatInteger(entry.outputPerSecond)
-    ))
+  end, debug.traceback)
+  local offOk, offReason = pcall(setRefillSource, route, entry.source, false)
+  dashboardPaused = false
+  uiUpdate({}, true)
+  if not offOk then
+    fail("cannot switch refill source off: " .. tostring(offReason)
+      .. (ok and "" or "; original error: " .. tostring(state)))
   end
+  if not ok then fail(state) end
+  if state == "order" or state == "stalled" then return state, observed end
+  current = observed
   log("INFO", string.format(
     "staged refill fluid %s=%s mB%s",
     entry.source,
@@ -1200,23 +1300,30 @@ local function replenishIdleStock(initialStored)
   log("INFO", "idle stock refill started: " .. deficitText(deficits))
   while next(deficits) do
     local beforeTotal = sumValues(stored)
+    local stagedTargets = {}
     for _, entry in ipairs(config.fluids) do
       local missing = entry.target - (stored[entry.condensate] or 0)
       if missing > 0 then
-      if hasAnyOrderInput(readNetwork()) then
-        log("INFO", "idle stock refill paused for incoming order")
-        return false
-      end
+        if hasAnyOrderInput(readNetwork()) then
+          log("INFO", "idle stock refill paused for incoming order")
+          return false
+        end
 
-      local stageState = stageRefillFluid(entry, missing)
-      if stageState == "order" then
-        log("INFO", "idle stock refill paused while staging for incoming order")
-        return false
-      end
+        local stageState = stageRefillFluid(entry, missing)
+        if stageState == "order" then
+          log("INFO", "idle stock refill paused while staging for incoming order")
+          return false
+        elseif stageState == "ready" then
+          stagedTargets[entry.condensate] = entry.target
+        end
       end
     end
 
-    local drainState, finalStored = drainRefillBatch()
+    if not next(stagedTargets) then
+      uiPhase("WAITING", "Refill sources did not deliver fluid; retrying later")
+      return false
+    end
+    local drainState, finalStored = drainRefillBatch(stagedTargets)
     if drainState == "order" then
       log("INFO", "idle stock refill paused while converting for incoming order")
       return false
@@ -1245,6 +1352,23 @@ local function waitForStableOrder()
 
   while true do
     local snapshot = readNetwork()
+    if dashboard and dashboard:hasConfigRequest() and not hasAnyOrderInput(snapshot) then
+      local buffered = readFluidCacheTotal()
+      local entanglerActive = readEntanglerActivity()
+      if buffered == 0 and not entanglerActive and dashboard:takeConfigRequest() then
+        local shown, values = pcall(dashboard.editFluidSettings, dashboard)
+        if not shown then
+          log("ERROR", "fluid config screen failed: " .. tostring(values))
+        elseif values then
+          local saved, reason = pcall(applyFluidSettings, values)
+          if not saved then log("ERROR", "fluid config was not saved: " .. tostring(reason)) end
+        end
+        stableSignature = nil
+        stableSince = nil
+        nextRefillCheck = 0
+        snapshot = readNetwork()
+      end
+    end
     if hasCompleteOrder(snapshot) then
       if snapshot.signature ~= stableSignature then
         stableSignature = snapshot.signature
@@ -1458,25 +1582,28 @@ local function tryHaltAutomaticRefill(activeFieldStrength, shortages)
 
   local stored = getStoredCondensate()
   local requiredStock = {}
-  log("WARN", "HALT attempting automatic-refill recovery: " .. deficitText(shortages))
+  log("WARN", "attempting automatic-refill recovery: " .. deficitText(shortages))
   for condensate, missing in pairs(shortages) do
     local entry = entryByCondensate[condensate]
     requiredStock[condensate] = (stored[condensate] or 0) + missing
     local stageState = stageRefillFluid(entry, missing, {
       interruptForOrder = false,
-      phase = "HALT",
-      detailPrefix = "HALT refill loading ",
+      phase = "RECOVERING",
+      detailPrefix = "Recovery refill loading ",
     })
-    if stageState ~= "ready" then
+    if stageState == "stalled" then
+      return activeFieldStrength, false,
+        "HALT refill source " .. entry.source .. " delivered no fluid; manual supply required"
+    elseif stageState ~= "ready" then
       fail("HALT automatic refill staging ended in unexpected state " .. tostring(stageState))
     end
   end
 
   local drainState, finalStored = drainRefillBatch(requiredStock, {
     interruptForOrder = false,
-    phase = "HALT",
-    detail = "HALT converting automatic-refill fluids",
-    logPrefix = "HALT automatic refill",
+    phase = "RECOVERING",
+    detail = "Converting automatic-refill fluids",
+    logPrefix = "automatic recovery refill",
   })
   finalStored = finalStored or getStoredCondensate()
   activeFieldStrength = math.max(
@@ -1488,7 +1615,7 @@ local function tryHaltAutomaticRefill(activeFieldStrength, shortages)
   if drainState ~= "ready" or next(remaining) then
     log("WARN", "HALT automatic-refill attempt ended without enough condensate: "
       .. deficitText(remaining))
-    return activeFieldStrength, false
+    return activeFieldStrength, false, "HALT automatic refill incomplete; manual supply required"
   end
 
   log("INFO", "HALT automatic-refill recovery reached the active recipe requirement")
@@ -1554,11 +1681,12 @@ local function haltForCondensateShortage(
 )
   haltLatched = true
   local detail = reason or ("Condensate shortage: " .. deficitText(shortages))
+  local recoveryPhase = (config.refill or {}).enabled and "RECOVERING" or "HALT"
   if stopErrors == nil then
-    stopErrors = applyCondensateFaultStop("HALT", detail, states, parallel)
+    stopErrors = applyCondensateFaultStop(recoveryPhase, detail, states, parallel)
   else
     uiUpdate({
-      phase = "HALT",
+      phase = recoveryPhase,
       detail = detail,
       haltActive = true,
       nodeStates = states,
@@ -1566,33 +1694,41 @@ local function haltForCondensateShortage(
     }, true)
   end
 
-  log("ERROR", "HALT: active-node condensate demand exceeds containment stock: "
+  log("WARN", "active-node condensate demand exceeds containment stock: "
     .. deficitText(shortages))
-  log("ERROR", "HALT reason: " .. detail)
-  for _, message in ipairs(stopErrors) do log("ERROR", "HALT shutdown failure: " .. message) end
-  uiUpdate({ phase = "HALT", detail = detail, haltActive = true }, true)
+  log("WARN", recoveryPhase .. " reason: " .. detail)
+  for _, message in ipairs(stopErrors) do log("ERROR", recoveryPhase .. " shutdown failure: " .. message) end
+  uiUpdate({ phase = recoveryPhase, detail = detail, haltActive = true }, true)
 
+  local manualRefillRequired = false
   if (config.refill or {}).enabled then
     local refillStored = getStoredCondensate()
     local refillIdle, _, refillParallel, refillRemaining = allNodesIdle()
     local refillShortages = getDeficits(refillRemaining, refillStored)
     if refillParallel > 0 and not refillIdle and next(refillShortages) then
-      local refillOk, updatedFieldStrength, refillSatisfied = xpcall(function()
+      uiPhase("RECOVERING", "Trying automatic refill for active nodes")
+      local refillOk, updatedFieldStrength, refillSatisfied, refillReason = xpcall(function()
         return tryHaltAutomaticRefill(activeFieldStrength, refillShortages)
       end, debug.traceback)
       if refillOk then
         activeFieldStrength = updatedFieldStrength
+        manualRefillRequired = not refillSatisfied
         detail = refillSatisfied
-          and "HALT automatic refill complete; verifying active recipe inventory"
-          or "HALT automatic refill incomplete; monitoring condensate inventory"
+          and "Automatic refill complete; verifying active recipe inventory"
+          or (refillReason or "HALT automatic refill incomplete; manual supply required")
       else
-        detail = "HALT automatic refill failed; monitoring condensate inventory"
+        manualRefillRequired = true
+        detail = "HALT automatic refill failed; manual supply required"
         log("ERROR", "HALT automatic-refill recovery failed: " .. tostring(updatedFieldStrength))
         dashboardPaused = false
         pcall(setAllRefillSourcesOff)
         pcall(setRefillLink, false)
       end
-      uiUpdate({ phase = "HALT", detail = detail, haltActive = true }, true)
+      uiUpdate({
+        phase = manualRefillRequired and "HALT" or "RECOVERING",
+        detail = detail,
+        haltActive = true,
+      }, true)
     end
   end
 
@@ -1645,7 +1781,8 @@ local function haltForCondensateShortage(
         log("ERROR", "HALT retry shutdown failure: " .. message)
       end
     elseif activeRecipePresent and next(currentShortages) then
-      detail = "HALT waiting for condensate: " .. deficitText(currentShortages)
+      detail = (manualRefillRequired and "HALT manual fluid supply required: "
+        or "HALT waiting for condensate: ") .. deficitText(currentShortages)
     elseif activeRecipePresent then
       detail = "HALT inventory is sufficient; waiting to retry machine resume"
     else
@@ -2295,52 +2432,47 @@ local function discover()
 end
 
 local function checkConfiguration()
+  local function outputText(device)
+    local values = checked("read all-face output", device.getOutput)
+    if type(values) ~= "table" then fail("redstone getOutput did not return a side table") end
+    local parts = {}
+    for face = 0, 5 do parts[#parts + 1] = tostring(tonumber(values[face]) or "?") end
+    return table.concat(parts, ",")
+  end
   print("Components found")
   print("  storage=" .. storage.address)
   print("  gate=" .. gate.address)
   print("  material-cache=" .. cache.address .. " (" .. cache.type .. ")")
   print("  item-cache=" .. itemCache.address .. " (" .. itemCache.type .. ")")
   print("  fluid-cache=" .. fluidCache.address .. " (" .. fluidCache.type .. ")")
-  print("  node-redstone=" .. nodeRedstone.address .. " side=" .. config.redstone.nodeToggleSide)
+  print("  node-redstone=" .. nodeRedstone.address .. " side=all")
   print("  node-transfer-pulse=" .. tostring(config.timings.nodeTransferPulse) .. "s")
   print("  order-fluid-transfer-redstone="
-    .. generatorRedstone.address .. " side=" .. config.redstone.generatorToggleSide)
+    .. generatorRedstone.address .. " side=all")
   print("  synthesis-active-redstone="
-    .. synthesisRedstone.address .. " side=" .. config.redstone.synthesisSide)
-  print("  synthesis-active-output=" .. tostring(checked(
-    "read synthesis-active output",
-    synthesisRedstone.getOutput,
-    config.redstone.synthesisSide
-  )))
-  print("  halt-redstone=" .. haltRedstone.address .. " side=" .. config.redstone.haltSide)
-  print("  halt-output=" .. tostring(checked(
-    "read HALT output",
-    haltRedstone.getOutput,
-    config.redstone.haltSide
-  )))
+    .. synthesisRedstone.address .. " side=all")
+  print("  synthesis-active-output=" .. outputText(synthesisRedstone))
+  print("  halt-redstone=" .. haltRedstone.address .. " side=all")
+  print("  halt-output=" .. outputText(haltRedstone))
   if (config.refill or {}).enabled then
     print("  refill-cache=" .. refillCache.address .. " (" .. refillCache.type .. ")")
     print("  refill-entangler-redstone=" .. refillLinkRedstone.address
-      .. " side=" .. config.refill.entanglerToggleSide)
+      .. " side=all")
     print("  refill-entangler-activity-redstone=" .. refillActivityRedstone.address
-      .. " side=" .. config.refill.activitySide)
+      .. " side=all")
     print("  refill-unused-route-output=" .. routeConfig.unusedOutput.address
       .. " side=" .. routeConfig.unusedOutput.side .. " (kept off)")
     print("  refill-fluid-config:")
     for _, entry in ipairs(config.fluids) do
       print(string.format(
-        "    %s target=%s rate=%s mB/s",
+        "    %s target=%s rate=%.3f L/s",
         entry.source,
         formatInteger(entry.target),
-        formatInteger(entry.outputPerSecond)
+        entry.rateLitersPerSecond
       ))
     end
     print("  refill-staged-fluids=" .. formatInteger(sumValues(readRefillFluids())))
-    print("  refill-entangler-output=" .. tostring(checked(
-      "read automatic-refill/entangler output",
-      refillLinkRedstone.getOutput,
-      config.refill.entanglerToggleSide
-    )))
+    print("  refill-entangler-output=" .. outputText(refillLinkRedstone))
     local entanglerActive, activitySignal = readEntanglerActivity()
     print("  refill-entangler-activity=" .. (entanglerActive and "running" or "idle")
       .. " signal=" .. tostring(activitySignal)
@@ -2381,16 +2513,16 @@ end
 
 local function cleanup()
   if controlsArmed and nodeRedstone then
-    pcall(setToggle, nodeRedstone, config.redstone.nodeToggleSide, "material/item-cache output", false)
+    pcall(setToggle, nodeRedstone, nil, "material/item-cache output", false)
   end
   if controlsArmed and generatorRedstone then
-    pcall(setToggle, generatorRedstone, config.redstone.generatorToggleSide, "material/fluid-cache output", false)
+    pcall(setToggle, generatorRedstone, nil, "material/fluid-cache output", false)
   end
   if controlsArmed and synthesisRedstone and not haltInterlockActive then
-    pcall(setToggle, synthesisRedstone, config.redstone.synthesisSide, "synthesis-active", false)
+    pcall(setToggle, synthesisRedstone, nil, "synthesis-active", false)
   end
   if controlsArmed and haltRedstone and not haltInterlockActive then
-    pcall(setToggle, haltRedstone, config.redstone.haltSide, "HALT", false)
+    pcall(setToggle, haltRedstone, nil, "HALT", false)
   end
   if controlsArmed and (config.refill or {}).enabled then
     for _, entry in ipairs(config.fluids) do

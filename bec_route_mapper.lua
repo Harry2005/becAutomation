@@ -10,6 +10,7 @@ local cacheInterface
 local referenceInterface
 local outputs = {}
 local controlsArmed = false
+local report = print
 
 local function now()
   return computer.uptime()
@@ -199,9 +200,13 @@ local function validateAndBind()
   for _, protected in ipairs(config.protectedControls or {}) do
     local device = bind("redstone", protected.address, protected.label, { "getOutput" })
     if seen[device.address] then fail("protected redstone I/O is also present in the probe list: " .. device.address) end
-    local value = tonumber(invoke(device, "getOutput", protected.side))
-    if value ~= config.inactiveSignal then
-      fail(string.format("%s must be disconnected before mapping; current output=%s", protected.label, tostring(value)))
+    local values = invoke(device, "getOutput")
+    if type(values) ~= "table" then fail(protected.label .. " did not return all-face outputs") end
+    for face = 0, 5 do
+      if tonumber(values[face]) ~= config.inactiveSignal then
+        fail(string.format("%s side %d must be disconnected before mapping; current output=%s",
+          protected.label, face, tostring(values[face])))
+      end
     end
   end
 end
@@ -209,7 +214,7 @@ end
 local function probeRoute(route, index)
   local baseline = waitForStableCache(config.timings.stableTimeout)
   local referenceBefore = tryReadFluids(referenceInterface)
-  print(string.format(
+  report(string.format(
     "[%02d/%02d] probing %s/%s",
     index,
     #outputs,
@@ -230,7 +235,7 @@ local function probeRoute(route, index)
     end
     if next(positiveDelta(baseline, current)) then break end
     if now() - lastStatus >= config.timings.statusInterval then
-      print(string.format("  waiting for fluid... %.1f/%.1f s", now() - started, config.timings.probeTimeout))
+      report(string.format("  waiting for fluid... %.1f/%.1f s", now() - started, config.timings.probeTimeout))
       lastStatus = now()
     end
   end
@@ -301,7 +306,7 @@ local function writeResult(path, complete, mapped, unresolved, unusedOutput)
   handle:close()
 end
 
-local function run()
+local function run(options)
   validateAndBind()
   controlsArmed = true
   turnAllOffStrict()
@@ -309,13 +314,20 @@ local function run()
   local expected = {}
   for _, fluid in ipairs(config.expectedFluids) do expected[fluid] = true end
   local initialCache = waitForStableCache(config.timings.stableTimeout)
-  local initialReference, referenceReason = tryReadFluids(referenceInterface)
-  print("cache interface=" .. cacheInterface.address .. " fluids={" .. fluidSignature(initialCache) .. "}")
-  print("reference interface=" .. referenceInterface.address
-    .. " fluids={" .. fluidSignature(initialReference or {}) .. "}")
-  if not config.allowNonEmptyCache and next(initialCache) then
-    fail("cache interface must be empty before mapping; clear its fluids or explicitly allow a non-empty cache")
+  while not config.allowNonEmptyCache and next(initialCache) do
+    report("cache interface=" .. cacheInterface.address .. " fluids={" .. fluidSignature(initialCache) .. "}")
+    if not options.onNonEmptyCache then
+      fail("cache interface must be empty before mapping; clear its fluids and retry")
+    end
+    if not options.onNonEmptyCache(initialCache) then
+      fail("mapping cancelled while waiting for an empty refill cache")
+    end
+    initialCache = waitForStableCache(config.timings.stableTimeout)
   end
+  local initialReference, referenceReason = tryReadFluids(referenceInterface)
+  report("cache interface=" .. cacheInterface.address .. " fluids={" .. fluidSignature(initialCache) .. "}")
+  report("reference interface=" .. referenceInterface.address
+    .. " fluids={" .. fluidSignature(initialReference or {}) .. "}")
   if config.requireAllExpectedInReference then
     if not initialReference then fail("cannot read reference interface: " .. tostring(referenceReason)) end
     local unavailable = {}
@@ -328,9 +340,9 @@ local function run()
       fail("reference interface is missing expected source fluids: " .. table.concat(unavailable, ","))
     end
   elseif not initialReference or not next(initialReference) then
-    print("reference inventory is empty or unavailable; continuing with cache fluid deltas")
+    report("reference inventory is empty or unavailable; continuing with cache fluid deltas")
   end
-  print("probing 20 outputs; only one output is active at a time")
+  report("probing 20 outputs; only one output is active at a time")
 
   local mapped = {}
   local unresolved = {}
@@ -342,14 +354,14 @@ local function run()
       if not expected[fluid] then
         probe.reason = "unexpected fluid"
         unresolved[#unresolved + 1] = probe
-        print("  unresolved: unexpected " .. fluid .. "=" .. string.format("%.0f", amount))
+        report("  unresolved: unexpected " .. fluid .. "=" .. string.format("%.0f", amount))
       elseif mapped[fluid] then
         probe.reason = "duplicate route for " .. fluid
         unresolved[#unresolved + 1] = probe
-        print("  unresolved: duplicate route for " .. fluid)
+        report("  unresolved: duplicate route for " .. fluid)
       else
         mapped[fluid] = probe
-        print(string.format(
+        report(string.format(
           "  mapped: %s +%.0f mB; reference={%s}",
           fluid,
           amount,
@@ -365,7 +377,7 @@ local function run()
         probe.reason = "multiple fluids detected"
       end
       unresolved[#unresolved + 1] = probe
-      print("  unresolved: " .. probe.reason .. "; cache={" .. changeText(probe.cacheDelta) .. "}")
+      report("  unresolved: " .. probe.reason .. "; cache={" .. changeText(probe.cacheDelta) .. "}")
     end
   end
 
@@ -382,39 +394,40 @@ local function run()
   local path = complete and config.outputFile or config.partialOutputFile
   writeResult(path, complete, mapped, complete and {} or unresolved, unusedOutput)
 
-  print(string.format(
+  report(string.format(
     "mapped=%d/%d unused=%d unresolved=%d",
     mappedCount,
     #config.expectedFluids,
     unusedOutput and 1 or 0,
     complete and 0 or #unresolved
   ))
-  if #missing > 0 then print("missing fluids=" .. table.concat(missing, ",")) end
+  if #missing > 0 then report("missing fluids=" .. table.concat(missing, ",")) end
   if unusedOutput then
-    print(string.format(
+    report(string.format(
       "unused output=%s/%s (%s)",
       unusedOutput.address,
       unusedOutput.sideName,
       unusedOutput.reason
     ))
-    print("this output remains OFF and is not used by the automation")
+    report("this output remains OFF and is not used by the automation")
   end
-  print("wrote " .. path)
-  print("all probe outputs are OFF; remove the transferred test fluids from the cache subnet")
+  report("wrote " .. path)
+  report("all probe outputs are OFF; remove the transferred test fluids from the cache subnet")
+  return { complete = complete, mapped = mappedCount, missing = missing, path = path }
 end
 
 local function checkOnly()
   validateAndBind()
   local cache = readFluids(cacheInterface)
   local reference, referenceReason = tryReadFluids(referenceInterface)
-  print("Read-only mapper check OK")
-  print("  cache=" .. cacheInterface.address .. " fluids={" .. fluidSignature(cache) .. "}")
-  print("  reference=" .. referenceInterface.address .. " fluids={"
+  report("Read-only mapper check OK")
+  report("  cache=" .. cacheInterface.address .. " fluids={" .. fluidSignature(cache) .. "}")
+  report("  reference=" .. referenceInterface.address .. " fluids={"
     .. fluidSignature(reference or {}) .. "}")
-  if not reference then print("  reference-read-warning=" .. tostring(referenceReason)) end
+  if not reference then report("  reference-read-warning=" .. tostring(referenceReason)) end
   for index, route in ipairs(outputs) do
     local value = tonumber(invoke(route.device, "getOutput", route.side))
-    print(string.format(
+    report(string.format(
       "  [%02d/%02d] %s/%s output=%s",
       index,
       #outputs,
@@ -425,22 +438,42 @@ local function checkOnly()
   end
 end
 
-local args = { ... }
-local command = args[1] or "run"
-if command ~= "run" and command ~= "check" then
-  fail("usage: lua bec_route_mapper.lua [check|run] [probe-seconds]")
-end
-if args[2] ~= nil then
-  local timeout = tonumber(args[2])
-  if not timeout or timeout < 1 or timeout > 300 then
-    fail("probe-seconds must be a number from 1 to 300")
+local function execute(command, options)
+  options = options or {}
+  if command ~= "run" and command ~= "check" then
+    return nil, "usage: lua bec_route_mapper.lua [check|run] [probe-seconds]"
   end
-  config.timings.probeTimeout = timeout
+  if options.probeTimeout ~= nil then
+    local timeout = tonumber(options.probeTimeout)
+    if not timeout or timeout < 1 or timeout > 300 then
+      return nil, "probe-seconds must be a number from 1 to 300"
+    end
+    config.timings.probeTimeout = timeout
+  end
+  outputs = {}
+  controlsArmed = false
+  report = options.report or print
+  local ok, result = xpcall(function()
+    if command == "check" then return checkOnly() end
+    return run(options)
+  end, debug.traceback)
+  if controlsArmed then turnAllOffBestEffort() end
+  if not ok then return nil, result end
+  return true, result
 end
 
-local ok, reason = xpcall(command == "check" and checkOnly or run, debug.traceback)
-if controlsArmed then turnAllOffBestEffort() end
+if ... == "bec_route_mapper" then return { execute = execute } end
+
+local args = { ... }
+local ok, result = execute(args[1] or "run", {
+  probeTimeout = args[2],
+  onNonEmptyCache = function()
+    io.write("Clear the refill cache fluids, then press Enter to recheck (Ctrl+C to cancel): ")
+    io.flush()
+    return io.read() ~= nil
+  end,
+})
 if not ok then
-  io.stderr:write(tostring(reason) .. "\n")
+  io.stderr:write(tostring(result) .. "\n")
   os.exit(1)
 end
